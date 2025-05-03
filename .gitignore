@@ -1,0 +1,5 @@
+.env
+sheets_credentials.json
+venv/
+*.pyc
+__pycache__/
