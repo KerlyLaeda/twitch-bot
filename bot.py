@@ -1,5 +1,5 @@
 from twitchio.ext import commands
-from twitchio.errors import AuthenticationError
+# from twitchio.errors import AuthenticationError
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import requests
@@ -28,14 +28,13 @@ TWITCH_ACCESS_TOKEN = os.getenv("TWITCH_ACCESS_TOKEN")
 TWITCH_REFRESH_TOKEN = os.getenv("TWITCH_REFRESH_TOKEN")
 TWITCH_BROADCASTER_ID = os.getenv("TWITCH_BROADCASTER_ID")
 
-# Google Sheets setup
+# Initialize Google Sheets
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 try:
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds = ServiceAccountCredentials.from_json_keyfile_name("sheet_credentials.json", scope)
     client = gspread.authorize(creds)
     sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
-    # sheet = client.open("relaxtokenbot").sheet1
 except Exception as e:  # which exception
     logging.error(f"Failed to initialize Google Sheets: {e}")
     sheet = None
@@ -119,45 +118,55 @@ class Bot(commands.Bot):
         super().__init__(
             token=access_token,
             client_id=TWITCH_CLIENT_ID,
-            nick="Relaxbot",  # need sep. acc 4 that
+            nick="Relaxbot",
             prefix="!",
             initial_channels=["kukaraczka"]
         )
         self.access_token = access_token
         self.refresh_token_value = TWITCH_REFRESH_TOKEN
 
-    async def event_ready(self):
-        logging.info(f"Bot {self.nick} is online.")  # twitch uses my username instead of nick
-        channel = self.connected_channels[0]
-        await channel.send("Bot is online!")
-        # noinspection PyAsyncCall
-        self.loop.create_task(self.token_refresh_loop())
+    async def ensure_valid_token(self):
+        """Ensure the token is valid, refreshing if needed. Return True if valid."""
+        expires_in, scopes = validate_token(self.access_token)
+        if expires_in < 300 and all(s in scopes for s in ["chat:read", "chat:edit"]):
+            return True
+        logging.info("Refreshing token...")
+        new_access_token, new_refresh_token = refresh_access_token(self.refresh_token_value)
+        if new_access_token and new_refresh_token:
+            self.access_token = new_access_token
+            self.refresh_token_value = new_refresh_token
+            self._connection._token = new_access_token
+            update_env_file(new_access_token, new_refresh_token)
+            return True
+        logging.error("Failed to refresh token.")
+        return False
 
     async def event_message(self, message):
         if message.echo:
             return
         await self.handle_commands(message)
 
+    async def event_ready(self):
+        logging.info(f"Bot {self.nick} is online.")
+        channel = self.connected_channels[0]
+        await channel.send("Bot is online!")
+        # noinspection PyAsyncCall
+        self.loop.create_task(self.token_refresh_loop())
+
     async def token_refresh_loop(self):
         """Periodically check and refresh token."""
         while True:
-            expires_in, scopes = validate_token(self.access_token)
-            if expires_in < 300:  # Refresh if expires in 5 minutes
-                new_access_token, new_refresh_token = refresh_access_token(self.refresh_token_value)
-                if new_access_token and new_refresh_token:
-                    self.access_token = new_access_token
-                    self.refresh_token_value = new_refresh_token
-                    self._connection._token = new_access_token
-                    update_env_file(new_access_token, new_refresh_token)
+            if not await self.ensure_valid_token():
+                logging.error("Token refresh failed in loop.")
             await asyncio.sleep(300)  # Check every 5 minutes (change to 3600)
 
     def get_user_points(self, username):
-        """Retrieve user tokens from Google Sheet."""
-        if not sheet:
+        """Retrieve custom tokens for a given user from Google Sheet."""
+        if not self.sheet:
             logging.error("Google Sheets not initialized")
             return None
         try:
-            records = sheet.get_all_records()
+            records = self.sheet.get_all_records()
             for record in records:
                 if record.get("Username", "").lower() == username.lower():
                     return record.get("Tokens", 0)
@@ -169,23 +178,15 @@ class Bot(commands.Bot):
             logging.error(f"Error getting tokens: {e}")
             return None
 
-    def update_user_points(self, username):
-        """Update user tokens."""
+    def update_user_points(self, username, points):
+        """Update custom tokens for a given user."""
         pass
 
     @commands.command(name="balance")
     async def check_balance(self, ctx):
-        expires_in, scopes = validate_token(self.access_token)
-        if expires_in < 300:
-            new_access_token, new_refresh_token = refresh_access_token(self.refresh_token_value)
-            if new_access_token and new_refresh_token:
-                self.access_token = new_access_token
-                self.refresh_token_value = new_refresh_token
-                self._connection._token = new_access_token
-                update_env_file(new_access_token, new_refresh_token)
-            else:
-                await ctx.send("Bot token expired.")
-                return
+        if not await self.ensure_valid_token():
+            await ctx.send("Access token expired. Please contact the bot owner.")
+            return
         points = self.get_user_points(ctx.author.name)
         if points:
             await ctx.send(f"@{ctx.author.name}, you have {points} tokens.")
@@ -196,15 +197,8 @@ class Bot(commands.Bot):
 if __name__ == "__main__":
     # Validate and refresh token before starting bot
     access_token = TWITCH_ACCESS_TOKEN
-    expires_in, scopes = validate_token(access_token)
-    # Regenerate if token is about to expire or missing required scopes
-    if expires_in < 300 or not all(s in scopes for s in ["chat:read", "chat:edit"]):
-        new_access_token, new_refresh_token = refresh_access_token(TWITCH_REFRESH_TOKEN)
-        if new_access_token and new_refresh_token:
-            access_token = new_access_token
-            update_env_file(new_access_token, new_refresh_token)
-        else:
-            logging.error("Failed to refresh token at startup. Exiting.")
-            exit(1)
     bot = Bot(access_token)
+    if not asyncio.run(bot.ensure_valid_token()):
+        logging.error("Failed to ensure valid token at startup. Exiting.")
+        exit(1)
     bot.run()
